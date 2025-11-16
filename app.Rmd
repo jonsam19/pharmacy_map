@@ -1,0 +1,331 @@
+---
+title: "Swedish Pharmacies 2024"
+output: 
+  flexdashboard::flex_dashboard:
+    theme:
+      version: 4
+      bg: "white"
+      fg: "#003540"
+      navbar-bg: "black"
+      primary: "#005966"
+      base_font: 
+        google: Inter
+      heading_font:
+        google: Overpass
+      code_font:
+        google: 
+          family: JetBrains Mono
+          local: false
+    vertical_layout: fill
+editor_options: 
+  chunk_output_type: console
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(knitr)
+library(leaflet)
+library(shiny)
+library(sf)
+library(shinyWidgets)
+
+
+# Load data --------------------------------------------------------------------
+df_apotek <- readRDS("data/processed/df_apotek.rds")
+
+# Load filter choices
+filter_choices <- readRDS("data/processed/filter_choices.rds")
+lan <- filter_choices$lan
+kommungrupp <- filter_choices$kommungrupp
+aktorer <- filter_choices$aktorer
+
+# Load shape files for map polygons
+lan_map <- st_read("data/processed/lan_map", quiet = TRUE)
+kommun_map <- st_read("data/processed/kommun_map", quiet = TRUE)
+
+# Colour palette for pharmacy operators (to be customised)
+pharmacy_colours <- c("#ff0000", "#44ad2c", "#102d69", "lightblue", "#ff9e17")
+```
+
+Map
+==================
+
+Sidebar {.sidebar data-width=270 .my-class}
+---------------------
+```{r sidebar, results='asis'}
+pickerInput(inputId = "select_indelning", label =  HTML("<strong>Select county:</strong>"),
+            choices = list(All = "Riket",
+                           County = lan),
+            options = list(`style` = "background: white"))
+
+pickerInput("select_kommungrupp", HTML("<strong>Select municipality group:</strong>"),
+            choices = kommungrupp,
+            selected = "All",
+            options = pickerOptions(dropdownAlignRight = TRUE,
+                                    `style` = "background: white;"))
+
+pickerInput(inputId = "select_aktor", label = HTML("<strong>Select pharmacy operator:</strong>"),
+            choices = aktorer, multiple = TRUE, selected = aktorer,
+            options = pickerOptions(`style` = "background: white", `actions-box` = TRUE,
+                                    selectAllText = "Select all", deselectAllText = "Deselect all"),
+            choicesOpt = list(style = paste0("background: ", pharmacy_colours, "; color: white;")))
+
+prettySwitch(inputId = "select_granser", label = HTML("<strong>National/county boundaries</strong>"),
+             value = FALSE, fill = TRUE)
+
+prettySwitch(inputId = "select_befolkningskarta", label = HTML("<strong>Municipality population</strong>"),
+             value = FALSE, fill = TRUE)
+
+numericRangeInput("select_dist_apotek", label = HTML("<strong>Distance to nearest pharmacy (km):</strong>"),
+            min = 0, max = ceiling(max(df_apotek$dist_km_narmaste_gln_korvag[is.finite(df_apotek$dist_km_narmaste_gln_korvag)], na.rm = TRUE)),
+            separator = "to",
+            value = c(0, ceiling(max(df_apotek$dist_km_narmaste_gln_korvag[is.finite(df_apotek$dist_km_narmaste_gln_korvag)], na.rm = TRUE))))
+
+sliderInput("select_sarbarhet2", label = HTML("<strong>Vulnerability index:</strong>"), value = c(0, 100),
+            min = 0, max = 100, sep = " ", ticks = FALSE)
+
+# custom button because the button doesn't work in Flexdashboard for some reason
+downloadButtonRmd <- function (outputId, label = "Download", class = NULL, ...)  {
+     tags$a(id = outputId, class = paste("btn btn-default shiny-download-link", 
+        class), href = "", target = "_blank", download = NA, 
+        icon("download"), label, ...)
+}
+
+downloadButtonRmd(outputId  = "downloadKarta", label = HTML("<strong>Download data</strong>"))
+
+cat("<br>")
+```
+
+```{r filtrera_data}
+# select pharmacies based on input from widgets
+valda_apotek <- reactive({
+  
+  filtered_data <- df_apotek %>% 
+    filter(
+      aktor %in% input$select_aktor,
+      percentil_sarbarhet >= input$select_sarbarhet2[1] & percentil_sarbarhet <= input$select_sarbarhet2[2],
+      dist_km_narmaste_gln_korvag >= input$select_dist_apotek[1] & dist_km_narmaste_gln_korvag <= input$select_dist_apotek[2]
+    )
+  
+  if (input$select_indelning %in% lan) {
+    filtered_data <- filtered_data %>% filter(lan == input$select_indelning)
+  }
+  
+  if (input$select_kommungrupp != "All") {
+    filtered_data <- filtered_data %>% filter(kommungrupp == input$select_kommungrupp)
+  }
+
+  return(filtered_data)
+})
+
+# county and national boundaries based on region selection
+lanskarta <- reactive({
+  if(input$select_indelning == "Riket"){
+    map <- lan_map %>% 
+      summarise(geometry = st_union(geometry))
+  }
+  
+  if(input$select_indelning %in% lan){
+    map <- lan_map %>%
+      filter(lan == input$select_indelning)
+  }
+  
+  return(map)
+})
+
+# population map based on municipality population
+befolkningskarta <- reactive({
+  if(input$select_indelning == "Riket"){
+    map <- kommun_map
+  }
+
+  if(input$select_indelning %in% lan){
+    map <- kommun_map %>%
+      filter(lan == input$select_indelning)
+  }
+
+  return(map)
+})
+
+
+# download selected pharmacies -------------------------------------------------
+output$downloadKarta <- downloadHandler(
+  filename = function() {
+    str_glue("apotek_karta_{Sys.Date()}.xlsx")
+  },
+  content = function(file) {
+    writexl::write_xlsx(valda_apotek() %>% 
+                          select(-c(starts_with("kvartil_"))), file)
+  }
+)
+```
+
+Kolumn 
+---------------------
+```{r interaktiv_karta, out.width = '100%', out.height = '100%'}
+# create palettes for pharmacies, agents, population ---------------------------
+pal_apotek <- colorFactor(palette = pharmacy_colours, levels = aktorer)
+bins <- c(0, 10e3, 20e3, 50e3, 100e3, 200e3, Inf)
+pal_pop <- colorBin("YlOrRd", domain = kommun_map$pop, bins = bins)
+
+
+# create leaflet map -----------------------------------------------------------
+output$map <- renderLeaflet({
+  
+  # base map
+    leaflet() %>%
+    addProviderTiles(providers$CartoDB.Positron) %>% 
+    addScaleBar(position = "bottomleft",
+                options = scaleBarOptions(imperial = FALSE)) |> 
+    setView(lat = 62.17432013788275, lng = 14.946378696886965, zoom = 5)
+
+})
+
+# Update map reactively without changing zoom or view
+observeEvent(eventExpr = {
+    input$select_granser
+    input$select_indelning
+    input$select_kommungrupp
+  }, handlerExpr = {
+  
+  leafletProxy("map") |> 
+    clearGroup("granser")
+  
+  # Update only markers without changing view or zoom
+  if(input$select_granser == TRUE) {
+  leafletProxy("map") %>%
+    addPolygons(data = lanskarta(),
+                fill = FALSE,
+                color = "black",
+                weight = 2,
+                group = "granser")
+  }
+})
+
+observeEvent(eventExpr = {
+    input$select_befolkningskarta
+    input$select_indelning
+  }, handlerExpr = {
+
+  leafletProxy("map") |>
+    clearGroup("befolkningskarta")
+
+  if(input$select_befolkningskarta == TRUE) {
+   leafletProxy("map") %>%
+      addPolygons(data = befolkningskarta(),
+                fillColor = ~pal_pop(pop),
+                popup = ~paste0(str_glue("<strong>{kommun}</strong>"), "<br>",
+                               str_glue("{format(pop, big.mark = ',')} inhabitants")),
+                color = "black", fillOpacity = 0.5, weight = 0.5,
+                group = "befolkningskarta")
+  }
+})
+
+observeEvent(eventExpr = {
+    input$select_aktor
+    input$select_indelning
+    input$select_kommungrupp
+    input$select_sarbarhet2
+    input$select_dist_apotek
+  }, handlerExpr = {
+
+  leafletProxy("map") |>
+    clearGroup("apotek") %>%
+    removeControl("legendApotek")
+
+   leafletProxy("map") %>%
+    addCircles(data = valda_apotek(),
+               radius = 10,
+               color = ~pal_apotek(aktor),
+               popup = ~paste0(str_glue("<strong>{namn}</strong>"), "<br>",
+                               str_glue("- <strong>Distance to nearest pharmacy:</strong> {round(dist_km_narmaste_gln_korvag, 1)} km"), "<br>",
+                               str_glue("- <strong>Vulnerability index:</strong> {percentil_sarbarhet}"), "<br>",
+                               str_glue("- <strong>Extra person-kilometres:</strong> {format(round(personkilometer_skillnad), big.mark = ',')}")),
+               opacity = 1,
+               fill = "black",
+               fillOpacity = 1,
+               weight = 8,
+               group = "apotek") |> 
+     addLegend(data = valda_apotek(),
+              pal = pal_apotek,
+              values = ~aktor,
+              title = "Pharmacy operator",
+              opacity = 1,
+              position = "bottomright",
+              layerId = "legendApotek"
+              )
+})
+
+leafletOutput("map", height=900)
+```
+
+About
+==================
+
+Column
+---------------------
+
+### Overview
+
+Interactive map visualizing Swedish pharmacy locations and accessibility metrics.
+
+**Key Features:**
+
+- Pharmacy locations across Sweden
+- Vulnerability index measuring closure impact
+- Population density by municipality
+- Filtering by county, operator, and distance
+
+**Methodology:**
+
+Vulnerability index = Population served × Increased travel distance if pharmacy closes
+
+Distances calculated using Vincenty ellipsoid (great-circle distance).
+
+### Data Sources
+
+**Pharmacy Locations**
+
+- [Pipos](https://pipos.se/vara-tjanster/serviceanalys) (November 12, 2025)
+
+**Population Data**
+
+- [Statistics Sweden (SCB)](https://www.scb.se/vara-tjanster/oppna-data/oppna-geodata/statistik-pa-rutor/) - 1km grid squares (2024)
+
+**Municipality Classifications**
+
+- Statistics Sweden (SCB) (2023)
+
+**Geographic Boundaries**
+
+- swemaps2 R package
+
+Column
+---------------------
+
+### Technical Details
+
+**Calculations:**
+
+- Distance method: Vincenty ellipsoid formula
+- Map projection: WGS84 (EPSG:4326)
+- Analysis tools: R (sf, geosphere, leaflet)
+
+**Data Processing:**
+
+- Nearest neighbor analysis for each pharmacy
+- Population-weighted distance calculations
+- Vulnerability metrics based on closure impact
+
+### About
+
+Portfolio project demonstrating geospatial analysis and interactive visualization.
+
+**Technologies:**
+
+- R Shiny & Flexdashboard
+- Leaflet.js mapping
+- Geospatial analysis (sf, geosphere)
+
+*Last updated: November 2025*
